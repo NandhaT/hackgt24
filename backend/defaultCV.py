@@ -34,6 +34,8 @@ class VideoCaptureAsync:
     def __init__(self, src=0):
         self.src = src
         self.cap = cv2.VideoCapture(self.src)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reduce resolution
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.grabbed, self.frame = self.cap.read()
         self.started = False
         self.read_lock = Lock()
@@ -88,25 +90,155 @@ def run_object_tracking():
     frame_height, frame_width = frame.shape[:2]
 
     # Zone setup
-    buffer = min(720, frame_width // 2, frame_height // 2)
+    buffer = min(240, frame_width // 2, frame_height // 2)
     ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
 
     # Load YOLO model
-    model = YOLO("yolov8n.pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = YOLO("yolov8n.pt").to(device)
 
     # Initialize DeepSORT tracker
-    tracker = DeepSort(max_age=50)
+    tracker = DeepSort(max_age=50, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
 
     # Dictionary to store consistent IDs
     track_history = {}
+
+    # Local cache for database operations
+    db_cache = {}
+    frame_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
+        frame_count += 1
+        if frame_count % 3 != 0:  # Process every 3rd frame
+            continue
+
+        # Resize frame for YOLO input
+        input_frame = cv2.resize(frame, (320, 320))
+
         # Run YOLO detection
-        detections = model(frame)[0]
+        results = model(input_frame)
+
+        # Process detections
+        dets = []
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0]
+                conf = box.conf.item()
+                cls = int(box.cls.item())
+                if conf > CONFIDENCE_THRESHOLD:
+                    dets.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
+
+        # Scale detections back to original frame size
+        scale_x, scale_y = frame_width / 320, frame_height / 320
+        scaled_dets = [([d[0][0] * scale_x, d[0][1] * scale_y, d[0][2] * scale_x, d[0][3] * scale_y], d[1], d[2]) for d in dets]
+
+        # Update tracks
+        tracks = tracker.update_tracks(scaled_dets, frame=frame)
+
+        current_frame_items = set()
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+
+            track_id = track.track_id
+            ltrb = track.to_ltrb()
+            xmin, ymin, xmax, ymax = map(int, ltrb)
+            
+            box_center = ((xmin + xmax) / 2, (ymin + ymax) / 2)
+            inside_zone = cv2.pointPolygonTest(ZONE_POLY, box_center, False) >= 0
+            
+            # Get class name for the track
+            if hasattr(track, 'det_class'):
+                class_name = model.names[track.det_class]
+            else:
+                class_name = "unknown"
+            
+            # Generate or retrieve consistent ID for the track
+            if track_id not in track_history:
+                track_history[track_id] = f"{class_name}_{len(track_history) + 1}"
+            
+            unique_id = track_history[track_id]
+            current_frame_items.add(unique_id)
+            
+            # Update local cache
+            if unique_id not in db_cache:
+                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
+            elif db_cache[unique_id]["is_inside"] != inside_zone:
+                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
+
+            color = GREEN if inside_zone else (0, 0, 255)
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+            cv2.rectangle(frame, (xmin, ymin - 20), (xmax, ymin), color, -1)
+            cv2.putText(frame, unique_id, (xmin + 5, ymin - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 2)
+
+        # Draw zone
+        cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
+
+        # Display frame
+        cv2.imshow('Object Tracking', frame)
+
+        # Batch update database every 30 frames
+        if frame_count % 30 == 0:
+            update_database(db_cache)
+            db_cache.clear()
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.stop()
+    cv2.destroyAllWindows()
+    CONFIDENCE_THRESHOLD = 0.8
+    GREEN = (0, 255, 0)
+    WHITE = (255, 255, 255)
+
+    # Initialize the camera feed
+    cap = VideoCaptureAsync(0).start()
+
+    if not cap.isOpened():
+        print("Failed to open camera.")
+        return
+
+    # Get frame dimensions
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to read frame.")
+        return
+    frame_height, frame_width = frame.shape[:2]
+
+    # Zone setup
+    buffer = min(240, frame_width // 2, frame_height // 2)
+    ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
+
+    # Load YOLO model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = YOLO("yolov8n.pt").to(device)
+
+    # Initialize DeepSORT tracker
+    tracker = DeepSort(max_age=50, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
+
+    # Dictionary to store consistent IDs
+    track_history = {}
+
+    # Local cache for database operations
+    db_cache = {}
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        if frame_count % 3 != 0:  # Process every 3rd frame
+            continue
+
+        # Run YOLO detection
+        detections = model(frame, size=320)[0]  # Reduce input size for YOLO
 
         # Process detections
         results = []
@@ -131,7 +263,7 @@ def run_object_tracking():
             xmin, ymin, xmax, ymax = int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])
             
             box_center = ((xmin + xmax) / 2, (ymin + ymax) / 2)
-            inside_zone = is_inside_zone(box_center, ZONE_POLY)
+            inside_zone = cv2.pointPolygonTest(ZONE_POLY, box_center, False) >= 0
             
             # Get class name for the track
             if hasattr(track, 'det_class'):
@@ -146,7 +278,11 @@ def run_object_tracking():
             unique_id = track_history[track_id]
             current_frame_items.add(unique_id)
             
-            track_item(unique_id, inside_zone)
+            # Update local cache
+            if unique_id not in db_cache:
+                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
+            elif db_cache[unique_id]["is_inside"] != inside_zone:
+                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
 
             color = GREEN if inside_zone else (0, 0, 255)
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
@@ -159,30 +295,32 @@ def run_object_tracking():
         # Display frame
         cv2.imshow('Object Tracking', frame)
 
+        # Batch update database every 30 frames
+        if frame_count % 30 == 0:
+            update_database(db_cache)
+            db_cache.clear()
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.stop()
     cv2.destroyAllWindows()
 
-# Utility function to check if the box center is inside the zone
-def is_inside_zone(box_center, zone_poly):
-    return cv2.pointPolygonTest(zone_poly, box_center, False) >= 0
+def update_database(db_cache):
+    for item_id, data in db_cache.items():
+        is_inside = data["is_inside"]
+        current_time = data["last_update"].isoformat()
+        item = collection.find_one({"item_id": item_id})
 
-# Utility function to track items in MongoDB
-def track_item(item_id, is_inside):
-    current_time = datetime.now().isoformat()
-    item = collection.find_one({"item_id": item_id})
-
-    if item:
-        if not is_inside and item["current_status"] == "inside":
-            collection.update_one({"item_id": item_id}, {"$set": {"current_status": "outside", "timestamp_exited": current_time}})
-        elif is_inside and item["current_status"] == "outside":
-            collection.update_one({"item_id": item_id}, {"$set": {"current_status": "inside", "timestamp_entered": current_time}})
-    else:
-        if is_inside:
-            new_item = {"item_id": item_id, "timestamp_entered": current_time, "timestamp_exited": None, "current_status": "inside"}
-            collection.insert_one(new_item)
+        if item:
+            if not is_inside and item["current_status"] == "inside":
+                collection.update_one({"item_id": item_id}, {"$set": {"current_status": "outside", "timestamp_exited": current_time}})
+            elif is_inside and item["current_status"] == "outside":
+                collection.update_one({"item_id": item_id}, {"$set": {"current_status": "inside", "timestamp_entered": current_time}})
+        else:
+            if is_inside:
+                new_item = {"item_id": item_id, "timestamp_entered": current_time, "timestamp_exited": None, "current_status": "inside"}
+                collection.insert_one(new_item)
 
 if __name__ == '__main__':
     # Start the Flask API in a separate thread
