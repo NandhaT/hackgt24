@@ -8,6 +8,9 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from flask_socketio import SocketIO, emit
+import base64
+import time
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -15,12 +18,40 @@ logging.basicConfig(level=logging.INFO)
 # Flask API setup
 app = Flask(__name__)
 CORS(app, resources={r"*": {"origins": "*"}})
+globalFrame = None
 
 # MongoDB connection
 mongo_uri = "mongodb+srv://pdiddy:pdiddy!@cluster0.ydaow.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = MongoClient(mongo_uri)
 db = client["medical_item_tracking"]
 collection = db["tracked_items"]
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@socketio.on('connect')
+def handle_connect():
+    print("Client connected")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print("Client disconnected")
+
+def gen_frames():
+    while True:
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 0]
+        frame = globalFrame
+        if frame is not None:
+            # Encode frame as JPEG
+            ret, buffer = cv2.imencode('.jpg', frame)
+            # Convert to base64 to send over WebSocket
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            # Send the frame over WebSocket
+            socketio.emit('frame', {'data': frame_base64})
+        time.sleep(0.1)
+
+@socketio.on('start_video')
+def start_video_stream():
+    gen_frames()  # Start capturing video frames
 
 # API route to get items currently inside the zone
 @app.route('/api/items/inside', methods=['GET'])
@@ -32,6 +63,9 @@ def get_items_inside_zone():
 def run_flask_api():
     """Run the Flask API in a separate thread."""
     app.run(host='0.0.0.0', port=5000)
+
+def run_socket():
+    socketio.run(app, host="0.0.0.0", port=5001)
 
 class VideoCaptureAsync:
     def __init__(self, src=0):
@@ -73,7 +107,6 @@ class VideoCaptureAsync:
     def __exit__(self, exc_type, exc_value, traceback):
         self.cap.release()
 
-
 class TrackManager:
     def __init__(self, max_age=15):
         self.tracks = {}
@@ -113,20 +146,25 @@ def run_object_tracking():
         return
     frame_height, frame_width = frame.shape[:2]
 
-    buffer = min(240, frame_width // 2, frame_height // 2)
-    ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
-
+    # Modify the buffer to make the zone wider
+    buffer_vertical = min(120, frame_height // 4)  # Reduced vertical buffer
+    buffer_horizontal = min(60, frame_width // 8)  # Reduced horizontal buffer
+    ZONE_POLY = np.array([
+        [buffer_horizontal, buffer_vertical], 
+        [frame_width - buffer_horizontal, buffer_vertical], 
+        [frame_width - buffer_horizontal, frame_height - buffer_vertical], 
+        [buffer_horizontal, frame_height - buffer_vertical]
+    ])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.hub.load('ultralytics/yolov5', 'custom', path='yolov5/runs/train/output7/weights/best.pt').to(device)
     model.conf = CONFIDENCE_THRESHOLD
 
-    # Reduce max_age for faster track removal
     tracker = DeepSort(max_age=15, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
 
-    track_manager = TrackManager(max_age=15)  # Initialize TrackManager
+    track_manager = TrackManager(max_age=15)
     db_cache = {}
     frame_count = 0
-    FRAME_SKIP = 3
+    FRAME_SKIP = 5
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -172,7 +210,6 @@ def run_object_tracking():
             unique_id = f"{class_name}_{track_id}"
             current_frame_items.add(unique_id)
             
-            # Update TrackManager
             track_manager.update(unique_id, (xmin, ymin, xmax, ymax), class_name, inside_zone)
 
             color = GREEN if inside_zone else (0, 0, 255)
@@ -182,9 +219,9 @@ def run_object_tracking():
 
         cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
 
-        cv2.imshow('Object Tracking', frame)
+        global globalFrame
+        globalFrame = frame
 
-        # Update database cache with active tracks
         active_tracks = track_manager.get_active_tracks()
         for unique_id, track_info in active_tracks.items():
             db_cache[unique_id] = {
@@ -192,7 +229,6 @@ def run_object_tracking():
                 "last_update": track_info['last_seen']
             }
 
-        # Batch update database every 30 frames
         if frame_count % 30 == 0:
             update_database(db_cache)
             db_cache.clear()
@@ -202,7 +238,6 @@ def run_object_tracking():
 
     cap.stop()
     cv2.destroyAllWindows()
-
 
 def update_database(db_cache):
     for item_id, data in db_cache.items():
@@ -221,9 +256,10 @@ def update_database(db_cache):
                 collection.insert_one(new_item)
 
 if __name__ == '__main__':
-    # Start the Flask API in a separate thread
     api_thread = Thread(target=run_flask_api)
     api_thread.start()
 
-    # Run object tracking in the main thread
+    socket_thread = Thread(target=run_socket)
+    socket_thread.start()
+    
     run_object_tracking()
