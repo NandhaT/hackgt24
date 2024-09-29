@@ -11,15 +11,20 @@ import ListItemText from '@mui/material/ListItemText';
 import Stack from '@mui/material/Stack';
 import Typography from '@mui/material/Typography';
 import Box from '@mui/material/Box';
+import { useEffect, useState } from 'react';
+import Alert from '@mui/material/Alert';
+import { Snackbar } from '@mui/base';
+import safeops from 'assets/images/icons/safeops.png';
+import { Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle } from '@mui/material';
 
 // project import
 import MainCard from 'components/MainCard';
 import AnalyticEcommerce from 'components/cards/statistics/AnalyticEcommerce';
 import MonthlyBarChart from './MonthlyBarChart';
 import ReportAreaChart from './ReportAreaChart';
-import UniqueVisitorCard from './UniqueVisitorCard';
+import VideoContainer from './VideoContainer';
 import SaleReportCard from './SaleReportCard';
-import OrdersTable from './OrdersTable';
+import OrdersTable from './UtensilTable';
 
 // assets
 import GiftOutlined from '@ant-design/icons/GiftOutlined';
@@ -29,6 +34,7 @@ import avatar1 from 'assets/images/users/avatar-1.png';
 import avatar2 from 'assets/images/users/avatar-2.png';
 import avatar3 from 'assets/images/users/avatar-3.png';
 import avatar4 from 'assets/images/users/avatar-4.png';
+import { set } from 'lodash';
 
 // avatar style
 const avatarSX = {
@@ -47,40 +53,140 @@ const actionSX = {
   transform: 'none'
 };
 
+function createData(id, name) {
+  return { id, name };
+}
+
+const rows = [
+  
+];
+
+const overlaySX = {
+  position: 'fixed',
+  top: 0,
+  left: 0,
+  width: '100vw',
+  height: '100vh',
+  backgroundColor: 'rgba(0, 0, 0, 0.5)', // Semi-transparent background
+  display: 'flex',
+  justifyContent: 'center',
+  alignItems: 'center',
+  zIndex: 9999, // Ensure it's on top of everything
+};
+
+
 // ==============================|| DASHBOARD - DEFAULT ||============================== //
 
 export default function DashboardDefault() {
+
+  const [showAlert, setShowAlert] = useState(false);
+  const[ success, setSuccess] = useState(false);
+
+  const handleClick = () => { 
+    if (rows.length > 0) {
+    setShowAlert(true);
+    } else {
+    setSuccess(true);
+    }
+  };
+
+  const [time, setTime] = useState({ minutes: 0, seconds: 0 });
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTime((prevTime) => {
+        const newSeconds = prevTime.seconds + 1;
+        const newMinutes = prevTime.minutes + Math.floor(newSeconds / 60);
+        return {
+          minutes: newMinutes,
+          seconds: newSeconds % 60
+        };
+      });
+    }, 1000);
+  
+    return () => clearInterval(timer);
+  }, []);
+
+  
+
   return (
     <Grid container rowSpacing={4.5} columnSpacing={2.75}>
       {/* row 1 */}
-      <Grid item xs={12} sx={{ mb: -2.25 }}>
-        <Typography variant="h5">Dashboard</Typography>
+      <Grid item xs={3}>
+        <Grid container alignItems="center">
+            <Typography variant="h4">SafeOps</Typography>
+        </Grid>
       </Grid>
-      <Grid item xs={12} sm={6} md={4} lg={3}>
-        <AnalyticEcommerce title="Total Page Views" count="4,42,236" percentage={59.3} extra="35,000" />
+
+      <Grid item xs={6}>
+      <Grid container alignItems="center" justifyContent="center">
+
+        <Typography variant="h4">
+          Time of Surgery: {time.minutes} minutes {time.seconds} seconds
+        </Typography>
+
       </Grid>
-      <Grid item xs={12} sm={6} md={4} lg={3}>
-        <AnalyticEcommerce title="Total Users" count="78,250" percentage={70.5} extra="8,900" />
-      </Grid>
-      <Grid item xs={12} sm={6} md={4} lg={3}>
-        <AnalyticEcommerce title="Total Order" count="18,800" percentage={27.4} isLoss color="warning" extra="1,943" />
-      </Grid>
-      <Grid item xs={12} sm={6} md={4} lg={3}>
-        <AnalyticEcommerce title="Total Sales" count="$35,078" percentage={27.4} isLoss color="warning" extra="$20,395" />
       </Grid>
 
       <Grid item md={8} sx={{ display: { sm: 'none', md: 'block', lg: 'none' } }} />
 
-      {/* row 2 */}
-      <Grid item xs={12} md={7} lg={8}>
-        <UniqueVisitorCard />
+      
+        <Grid item xs={8} sx={{ mb: 3 }} >
+          <VideoContainer />
+        </Grid>
+
+        <Grid item xs={4}>
+          <Grid container alignItems="center" justifyContent="space-between">
+            <Grid item>
+          <Typography variant="h5" color="red">Utensils in Use</Typography>
+            </Grid>
+            <Grid item />
+          </Grid>
+          <MainCard sx={{ mt: 2, mb: 3}}  content={false}>
+            <OrdersTable rows={rows} />
+          </MainCard>
+
+          <Dialog open={showAlert} onClose={() => setShowAlert(false)}>
+            <DialogContent>
+          <DialogContentText>
+          <Typography variant="h5" color="red">Some of the utensils have not been returned!</Typography>
+          </DialogContentText>
+            </DialogContent>
+            <DialogActions>
+          <Button onClick={() => setShowAlert(false)} color="primary">
+            Close
+          </Button>
+            </DialogActions>
+          </Dialog>
+
+          <Dialog open={success} onClose={() => window.location.href = "/login"}>
+            <DialogContent>
+              <DialogContentText>
+                <Typography variant="h5" color="green">All utensils returned!</Typography>
+              </DialogContentText>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => window.location.href = "/login"} color="primary">
+                Close
+              </Button>
+            </DialogActions>
+          </Dialog>
+        </Grid>
+
+        {/* row 3 */}
+      <Grid item xs={12}>
+        <Grid container alignItems="center" justifyContent="center">
+          <Button variant="contained" color="primary" onClick={handleClick} size="large">
+            End Session
+          </Button>
+        </Grid>
       </Grid>
-      <Grid item xs={12} md={5} lg={4}>
-        <Grid container alignItems="center" justifyContent="space-between">
+
+      {/* <Grid item xs={12} md={5} lg={4}>
+        <Grid container alignItems="center" justifyContent="center">
           <Grid item>
             <Typography variant="h5">Income Overview</Typography>
           </Grid>
-          <Grid item />
         </Grid>
         <MainCard sx={{ mt: 2 }} content={false}>
           <Box sx={{ p: 3, pb: 0 }}>
@@ -93,21 +199,10 @@ export default function DashboardDefault() {
           </Box>
           <MonthlyBarChart />
         </MainCard>
-      </Grid>
+      </Grid> */}
 
       {/* row 3 */}
-      <Grid item xs={12} md={7} lg={8}>
-        <Grid container alignItems="center" justifyContent="space-between">
-          <Grid item>
-            <Typography variant="h5">Recent Orders</Typography>
-          </Grid>
-          <Grid item />
-        </Grid>
-        <MainCard sx={{ mt: 2 }} content={false}>
-          <OrdersTable />
-        </MainCard>
-      </Grid>
-      <Grid item xs={12} md={5} lg={4}>
+      {/* <Grid item xs={12} md={5} lg={4}>
         <Grid container alignItems="center" justifyContent="space-between">
           <Grid item>
             <Typography variant="h5">Analytics Report</Typography>
@@ -131,10 +226,10 @@ export default function DashboardDefault() {
           </List>
           <ReportAreaChart />
         </MainCard>
-      </Grid>
+      </Grid> */}
 
       {/* row 4 */}
-      <Grid item xs={12} md={7} lg={8}>
+      {/* <Grid item xs={12} md={7} lg={8}>
         <SaleReportCard />
       </Grid>
       <Grid item xs={12} md={5} lg={4}>
@@ -240,7 +335,7 @@ export default function DashboardDefault() {
             </Button>
           </Stack>
         </MainCard>
-      </Grid>
+      </Grid> */}
     </Grid>
   );
 }
