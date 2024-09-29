@@ -25,7 +25,7 @@ const headCells = [
     id: 'name',
     align: 'left',
     disablePadding: false,
-    label: 'Utensil Name'
+    label: 'Timestamp'
   }
 ];
 
@@ -57,7 +57,7 @@ export default function OrderTable({ rows }) {
   const orderBy = 'id';
 
   return (
-    <Box sx={{ overflow: 'auto', maxHeight: 350 }}>
+    <Box sx={{ overflow: 'auto', maxHeight: 460 }}>
       <TableContainer
         sx={{
           width: '100%',

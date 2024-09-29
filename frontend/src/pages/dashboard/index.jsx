@@ -16,6 +16,7 @@ import Alert from '@mui/material/Alert';
 import { Snackbar } from '@mui/base';
 import safeops from 'assets/images/icons/safeops.png';
 import { Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle } from '@mui/material';
+import axios from 'axios';
 
 // project import
 import MainCard from 'components/MainCard';
@@ -58,7 +59,8 @@ function createData(id, name) {
 }
 
 const rows = [
-  
+  createData(1, 'Scalpel'),
+  createData(2, 'Forceps'),
 ];
 
 const overlaySX = {
@@ -82,8 +84,37 @@ export default function DashboardDefault() {
   const [showAlert, setShowAlert] = useState(false);
   const[ success, setSuccess] = useState(false);
 
+  const [data, setData] = useState([]); // Your data from the backend
+
+  useEffect(() => {
+    const pollAPI = () => {
+      axios.get('http://10.91.189.113:5000/api/items/inside')
+        .then((response) => {
+          const resp = response.data;
+          const newData = resp.map((item, index) => {
+            const localTime = new Date(item.timestamp_entered).toLocaleString();
+            return createData(item.item_id, localTime);
+          });
+          
+          setData(newData);
+          console.log(newData);
+          console.log(rows);
+        })
+        .catch((error) => {
+          console.error('Error fetching data:', error);
+        });
+    };
+
+    pollAPI();
+    const intervalId = setInterval(pollAPI, 2000);
+    return () => clearInterval(intervalId);
+  }, []);
+
+
+
+
   const handleClick = () => { 
-    if (rows.length > 0) {
+    if (data.length > 0) {
     setShowAlert(true);
     } else {
     setSuccess(true);
@@ -110,7 +141,7 @@ export default function DashboardDefault() {
   
 
   return (
-    <Grid container rowSpacing={4.5} columnSpacing={2.75}>
+    <Grid container rowSpacing={12} columnSpacing={2.75}>
       {/* row 1 */}
       <Grid item xs={3}>
         <Grid container alignItems="center">
@@ -131,11 +162,11 @@ export default function DashboardDefault() {
       <Grid item md={8} sx={{ display: { sm: 'none', md: 'block', lg: 'none' } }} />
 
       
-        <Grid item xs={8} sx={{ mb: 3 }} >
+        <Grid item xs={6} sx={{ mb: 3 }} container alignItems="center" justifyContent="space-between">
           <VideoContainer />
         </Grid>
 
-        <Grid item xs={4}>
+        <Grid item xs={6}>
           <Grid container alignItems="center" justifyContent="space-between">
             <Grid item>
           <Typography variant="h5" color="red">Utensils in Use</Typography>
@@ -143,7 +174,7 @@ export default function DashboardDefault() {
             <Grid item />
           </Grid>
           <MainCard sx={{ mt: 2, mb: 3}}  content={false}>
-            <OrdersTable rows={rows} />
+            <OrdersTable rows={data} />
           </MainCard>
 
           <Dialog open={showAlert} onClose={() => setShowAlert(false)}>
