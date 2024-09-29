@@ -3,17 +3,15 @@ import cv2
 import numpy as np
 from pymongo import MongoClient
 from datetime import datetime
-import time
 from threading import Thread, Lock
-from deep_sort_realtime.deepsort_tracker import DeepSort
+from flask import Flask, jsonify
 
-# Load YOLOv5 model (use GPU if available)
+# Object Tracking Setup (your current code)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True).to(device)
 
-# Function to read frames asynchronously using a separate thread
 class VideoCaptureAsync:
-    def __init__(self, src=0):
+    def __init__(self, src=0):  # Accepting the camera source as a parameter
         self.src = src
         self.cap = cv2.VideoCapture(self.src)
         self.grabbed, self.frame = self.cap.read()
@@ -50,46 +48,112 @@ class VideoCaptureAsync:
     def __exit__(self, exc_type, exc_value, traceback):
         self.cap.release()
 
-# Open the camera feed asynchronously
-cap = VideoCaptureAsync(0).start()
+# Flask API setup
+app = Flask(__name__)
 
-# Get initial camera resolution
-if cap.isOpened():
-    ret, frame = cap.read()
-    if ret:
-        frame_height, frame_width = frame.shape[:2]
-        print(f"Camera resolution: {frame_width}x{frame_height}")
-else:
-    print("Failed to open camera.")
-
-# MongoDB connection string
+# MongoDB connection
 mongo_uri = "mongodb+srv://pdiddy:pdiddy!@cluster0.ydaow.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = MongoClient(mongo_uri)
-db = client["item_tracking"]
+db = client["medical_item_tracking"]
 collection = db["tracked_items"]
 
-# Define operating zone polygon (central zone with buffer of 720 units)
-buffer = 720
-buffer = min(buffer, frame_width // 2, frame_height // 2)
-ZONE_POLY = np.array([
-    [buffer, 0],
-    [frame_width - buffer, 0],
-    [frame_width - buffer, frame_height],
-    [buffer, frame_height]
-])
+# API route to get items currently inside the zone
+@app.route('/api/items/inside', methods=['GET'])
+def get_items_inside_zone():
+    inside_items = collection.find({"current_status": "inside"})
+    item_list = [{"item_id": item["item_id"], "timestamp_entered": item["timestamp_entered"]} for item in inside_items]
+    return jsonify(item_list)
 
-# Dictionary to track items across frames based on their class
-tracked_items = {}
-class_counters = {}  # Counter to assign unique IDs for each class
+def run_flask_api():
+    """Run the Flask API in a separate thread."""
+    app.run(host='0.0.0.0', port=5000)
 
-# Map YOLOv5 class IDs to object names (like 'person', 'car', etc.)
-class_names = model.names  # This will give a list of class names (0 -> 'person', 1 -> 'bicycle', etc.)
+# Object Tracking Loop
+def run_object_tracking():
+    # Initialize the camera feed
+    cap = VideoCaptureAsync(0).start()
 
-# Function to check if a point is inside the polygon zone
+    if cap.isOpened():
+        ret, frame = cap.read()
+        if ret:
+            frame_height, frame_width = frame.shape[:2]
+    else:
+        print("Failed to open camera.")
+        return
+
+    # Zone setup (your current code)
+    buffer = 720
+    buffer = min(buffer, frame_width // 2, frame_height // 2)
+    ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
+
+    tracked_items = {}
+    class_counters = {}
+    class_names = model.names
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        results = model(frame)
+        detections = results.xyxy[0].cpu().numpy()
+        current_frame_items = set()
+
+        for detection in detections:
+            x1, y1, x2, y2, confidence, class_id = detection[:6]
+            class_id = int(class_id)
+            box_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+            box_center_int = (int(box_center[0]), int(box_center[1]))
+
+            class_name = class_names[class_id]
+            if class_name not in class_counters:
+                class_counters[class_name] = 0
+
+            item_id = None
+            for tracked_id, data in tracked_items.items():
+                if data["class_name"] == class_name and not data["inside_zone"]:
+                    item_id = tracked_id
+                    break
+
+            if not item_id:
+                item_id = f'{class_name}_{class_counters[class_name]}'
+                class_counters[class_name] += 1
+
+            inside_zone = is_inside_zone(box_center_int, ZONE_POLY)
+            current_frame_items.add(item_id)
+
+            if item_id not in tracked_items:
+                tracked_items[item_id] = {"class_name": class_name, "inside_zone": inside_zone, "last_seen": datetime.now()}
+                track_item(item_id, inside_zone)
+            else:
+                prev_status = tracked_items[item_id]["inside_zone"]
+                if inside_zone != prev_status:
+                    track_item(item_id, inside_zone)
+                    tracked_items[item_id]["inside_zone"] = inside_zone
+
+            color = (0, 255, 0) if inside_zone else (0, 0, 255)
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(frame, f'ID: {item_id}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
+        cv2.imshow('Object Tracking', frame)
+
+        for tracked_item_id in list(tracked_items.keys()):
+            if tracked_item_id not in current_frame_items:
+                tracked_items[tracked_item_id]["inside_zone"] = False
+                track_item(tracked_item_id, False)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.stop()
+    cv2.destroyAllWindows()
+
+# Utility function to check if the box center is inside the zone
 def is_inside_zone(box_center, zone_poly):
     return cv2.pointPolygonTest(zone_poly, box_center, False) >= 0
 
-# Function to track the item in MongoDB
+# Utility function to track items in MongoDB
 def track_item(item_id, is_inside):
     current_time = datetime.now().isoformat()
     item = collection.find_one({"item_id": item_id})
@@ -97,98 +161,17 @@ def track_item(item_id, is_inside):
     if item:
         if not is_inside and item["current_status"] == "inside":
             collection.update_one({"item_id": item_id}, {"$set": {"current_status": "outside", "timestamp_exited": current_time}})
-            print(f"Item {item_id} has exited the zone.")
         elif is_inside and item["current_status"] == "outside":
             collection.update_one({"item_id": item_id}, {"$set": {"current_status": "inside", "timestamp_entered": current_time}})
-            print(f"Item {item_id} has re-entered the zone.")
     else:
         if is_inside:
-            new_item = {
-                "item_id": item_id,
-                "timestamp_entered": current_time,
-                "timestamp_exited": None,
-                "current_status": "inside"
-            }
+            new_item = {"item_id": item_id, "timestamp_entered": current_time, "timestamp_exited": None, "current_status": "inside"}
             collection.insert_one(new_item)
-            print(f"New item {item_id} entered the zone.")
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+if __name__ == '__main__':
+    # Start the Flask API in a separate thread
+    api_thread = Thread(target=run_flask_api)
+    api_thread.start()
 
-    # Detect objects using YOLOv5
-    results = model(frame)
-    detections = results.xyxy[0].cpu().numpy()
-
-    # Track items in the current frame
-    current_frame_items = set()
-
-    for detection in detections:
-        x1, y1, x2, y2, confidence, class_id = detection[:6]
-        class_id = int(class_id)  # Ensure class_id is an integer
-        box_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-        box_center_int = (int(box_center[0]), int(box_center[1]))
-
-        # Get the object class name
-        class_name = class_names[class_id]
-
-        # Initialize the counter for this class if it doesn't exist
-        if class_name not in class_counters:
-            class_counters[class_name] = 0
-
-        # Check if this object has been tracked before
-        item_id = None
-        for tracked_id, data in tracked_items.items():
-            if data["class_name"] == class_name and not data["inside_zone"]:  # If the same class is re-detected
-                item_id = tracked_id
-                break
-
-        # If the object is new (not previously tracked), create a new item ID
-        if not item_id:
-            item_id = f'{class_name}_{class_counters[class_name]}'
-            class_counters[class_name] += 1
-
-        # Check if the center of the bounding box is inside the polygon zone
-        inside_zone = is_inside_zone(box_center_int, ZONE_POLY)
-
-        # Add the item_id to the set of currently tracked items
-        current_frame_items.add(item_id)
-
-        # If this item is not already tracked, track it
-        if item_id not in tracked_items:
-            tracked_items[item_id] = {"class_name": class_name, "inside_zone": inside_zone, "last_seen": datetime.now()}
-            track_item(item_id, inside_zone)
-        else:
-            # Update tracking information in MongoDB if the status changed
-            prev_status = tracked_items[item_id]["inside_zone"]
-            if inside_zone != prev_status:
-                track_item(item_id, inside_zone)
-                tracked_items[item_id]["inside_zone"] = inside_zone
-
-        # Draw bounding box and label (with item_id)
-        color = (0, 255, 0) if inside_zone else (0, 0, 255)  # Green if inside the zone, red if outside
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-
-        # Display the item ID above the bounding box
-        cv2.putText(frame, f'ID: {item_id}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-    # Draw the polygon zone
-    cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
-
-    # Display the frame with bounding boxes and the polygon zone
-    cv2.imshow('Object Tracking', frame)
-
-    # Remove items that have not been seen in the current frame
-    for tracked_item_id in list(tracked_items.keys()):
-        if tracked_item_id not in current_frame_items:
-            tracked_items[tracked_item_id]["inside_zone"] = False
-            track_item(tracked_item_id, False)
-
-    # Exit loop when 'q' is pressed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# Release the camera and close OpenCV windows
-cap.stop()
-cv2.destroyAllWindows()
+    # Run object tracking in the main thread
+    run_object_tracking()
