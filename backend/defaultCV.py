@@ -5,6 +5,7 @@ from pymongo import MongoClient
 from datetime import datetime
 from threading import Thread, Lock
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 # Object Tracking Setup (your current code)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -50,6 +51,7 @@ class VideoCaptureAsync:
 
 # Flask API setup
 app = Flask(__name__)
+CORS(app, resources={r"*": {"origins": "*"}})
 
 # MongoDB connection
 mongo_uri = "mongodb+srv://pdiddy:pdiddy!@cluster0.ydaow.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
