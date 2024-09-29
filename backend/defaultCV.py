@@ -11,6 +11,7 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from flask_socketio import SocketIO, emit
 import base64
 import time
+from datetime import datetime, timedelta
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -164,7 +165,7 @@ def run_object_tracking():
     track_manager = TrackManager(max_age=15)
     db_cache = {}
     frame_count = 0
-    FRAME_SKIP = 5
+    FRAME_SKIP = 4
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -240,20 +241,49 @@ def run_object_tracking():
     cv2.destroyAllWindows()
 
 def update_database(db_cache):
+    current_time = datetime.now()
+    
+    # Get all items currently in the database
+    all_items = set(item['item_id'] for item in collection.find({}, {'item_id': 1}))
+    
+    # Items seen in the current frame
+    seen_items = set(db_cache.keys())
+    
     for item_id, data in db_cache.items():
         is_inside = data["is_inside"]
-        current_time = data["last_update"].isoformat()
+        last_update = data["last_update"]
         item = collection.find_one({"item_id": item_id})
 
         if item:
             if not is_inside and item["current_status"] == "inside":
-                collection.update_one({"item_id": item_id}, {"$set": {"current_status": "outside", "timestamp_exited": current_time}})
+                collection.update_one(
+                    {"item_id": item_id},
+                    {"$set": {"current_status": "outside", "timestamp_exited": last_update.isoformat()}}
+                )
             elif is_inside and item["current_status"] == "outside":
-                collection.update_one({"item_id": item_id}, {"$set": {"current_status": "inside", "timestamp_entered": current_time}})
+                collection.update_one(
+                    {"item_id": item_id},
+                    {"$set": {"current_status": "inside", "timestamp_entered": last_update.isoformat()}}
+                )
         else:
             if is_inside:
-                new_item = {"item_id": item_id, "timestamp_entered": current_time, "timestamp_exited": None, "current_status": "inside"}
+                new_item = {
+                    "item_id": item_id,
+                    "timestamp_entered": last_update.isoformat(),
+                    "timestamp_exited": None,
+                    "current_status": "inside"
+                }
                 collection.insert_one(new_item)
+
+    # Find items to delete (not seen in current frame and outside the zone)
+    items_to_delete = all_items - seen_items
+    for item_id in items_to_delete:
+        item = collection.find_one({"item_id": item_id})
+        if item and item["current_status"] == "outside":
+            # Delete the item if it's been outside for more than 30 seconds
+            last_exit = datetime.fromisoformat(item["timestamp_exited"])
+            if current_time - last_exit > timedelta(seconds=30):
+                collection.delete_one({"item_id": item_id})
 
 if __name__ == '__main__':
     api_thread = Thread(target=run_flask_api)
