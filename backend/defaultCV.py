@@ -8,6 +8,9 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 # Flask API setup
 app = Flask(__name__)
@@ -70,75 +73,87 @@ class VideoCaptureAsync:
     def __exit__(self, exc_type, exc_value, traceback):
         self.cap.release()
 
+
+class TrackManager:
+    def __init__(self, max_age=15):
+        self.tracks = {}
+        self.max_age = max_age
+
+    def update(self, track_id, bbox, class_name, inside_zone):
+        self.tracks[track_id] = {
+            'last_seen': datetime.now(),
+            'bbox': bbox,
+            'class_name': class_name,
+            'inside_zone': inside_zone
+        }
+
+    def get_active_tracks(self):
+        current_time = datetime.now()
+        active_tracks = {}
+        for track_id, track_info in list(self.tracks.items()):
+            if (current_time - track_info['last_seen']).total_seconds() < self.max_age:
+                active_tracks[track_id] = track_info
+            else:
+                del self.tracks[track_id]
+        return active_tracks
+
 def run_object_tracking():
-    CONFIDENCE_THRESHOLD = 0.8
+    CONFIDENCE_THRESHOLD = 0.4
     GREEN = (0, 255, 0)
     WHITE = (255, 255, 255)
 
-    # Initialize the camera feed
     cap = VideoCaptureAsync(0).start()
-
     if not cap.isOpened():
-        print("Failed to open camera.")
+        logging.error("Failed to open camera.")
         return
 
-    # Get frame dimensions
     ret, frame = cap.read()
     if not ret:
-        print("Failed to read frame.")
+        logging.error("Failed to read frame.")
         return
     frame_height, frame_width = frame.shape[:2]
 
-    # Zone setup
     buffer = min(240, frame_width // 2, frame_height // 2)
     ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
 
-    # Load YOLO model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = YOLO("yolov8n.pt").to(device)
+    model = torch.hub.load('ultralytics/yolov5', 'custom', path='yolov5/runs/train/output7/weights/best.pt').to(device)
+    model.conf = CONFIDENCE_THRESHOLD
 
-    # Initialize DeepSORT tracker
-    tracker = DeepSort(max_age=50, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
+    # Reduce max_age for faster track removal
+    tracker = DeepSort(max_age=15, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
 
-    # Dictionary to store consistent IDs
-    track_history = {}
-
-    # Local cache for database operations
+    track_manager = TrackManager(max_age=15)  # Initialize TrackManager
     db_cache = {}
     frame_count = 0
+    FRAME_SKIP = 3
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
+            logging.warning("Failed to read frame, breaking the loop")
             break
 
         frame_count += 1
-        if frame_count % 3 != 0:  # Process every 3rd frame
+        if frame_count % FRAME_SKIP != 0:
             continue
 
-        # Resize frame for YOLO input
         input_frame = cv2.resize(frame, (320, 320))
 
-        # Run YOLO detection
-        results = model(input_frame)
+        with torch.no_grad():
+            results = model(input_frame)
 
-        # Process detections
-        dets = []
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0]
-                conf = box.conf.item()
-                cls = int(box.cls.item())
-                if conf > CONFIDENCE_THRESHOLD:
-                    dets.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
+        dets = results.xyxy[0].cpu().numpy()
+        dets = dets[dets[:, 4] > CONFIDENCE_THRESHOLD]
 
-        # Scale detections back to original frame size
         scale_x, scale_y = frame_width / 320, frame_height / 320
-        scaled_dets = [([d[0][0] * scale_x, d[0][1] * scale_y, d[0][2] * scale_x, d[0][3] * scale_y], d[1], d[2]) for d in dets]
+        scaled_dets = dets[:, :4] * np.array([scale_x, scale_y, scale_x, scale_y])
+        confidences = dets[:, 4]
+        class_ids = dets[:, 5].astype(int)
 
-        # Update tracks
-        tracks = tracker.update_tracks(scaled_dets, frame=frame)
+        tracker_dets = [([x1, y1, x2 - x1, y2 - y1], conf, cls) for (x1, y1, x2, y2), conf, cls in zip(scaled_dets, confidences, class_ids)]
+
+        tracks = tracker.update_tracks(tracker_dets, frame=frame)
 
         current_frame_items = set()
         for track in tracks:
@@ -152,35 +167,30 @@ def run_object_tracking():
             box_center = ((xmin + xmax) / 2, (ymin + ymax) / 2)
             inside_zone = cv2.pointPolygonTest(ZONE_POLY, box_center, False) >= 0
             
-            # Get class name for the track
-            if hasattr(track, 'det_class'):
-                class_name = model.names[track.det_class]
-            else:
-                class_name = "unknown"
+            class_name = model.names[track.det_class] if hasattr(track, 'det_class') else "unknown"
             
-            # Generate or retrieve consistent ID for the track
-            if track_id not in track_history:
-                track_history[track_id] = f"{class_name}_{len(track_history) + 1}"
-            
-            unique_id = track_history[track_id]
+            unique_id = f"{class_name}_{track_id}"
             current_frame_items.add(unique_id)
             
-            # Update local cache
-            if unique_id not in db_cache:
-                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
-            elif db_cache[unique_id]["is_inside"] != inside_zone:
-                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
+            # Update TrackManager
+            track_manager.update(unique_id, (xmin, ymin, xmax, ymax), class_name, inside_zone)
 
             color = GREEN if inside_zone else (0, 0, 255)
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
             cv2.rectangle(frame, (xmin, ymin - 20), (xmax, ymin), color, -1)
             cv2.putText(frame, unique_id, (xmin + 5, ymin - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 2)
 
-        # Draw zone
         cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
 
-        # Display frame
         cv2.imshow('Object Tracking', frame)
+
+        # Update database cache with active tracks
+        active_tracks = track_manager.get_active_tracks()
+        for unique_id, track_info in active_tracks.items():
+            db_cache[unique_id] = {
+                "is_inside": track_info['inside_zone'],
+                "last_update": track_info['last_seen']
+            }
 
         # Batch update database every 30 frames
         if frame_count % 30 == 0:
@@ -192,119 +202,7 @@ def run_object_tracking():
 
     cap.stop()
     cv2.destroyAllWindows()
-    CONFIDENCE_THRESHOLD = 0.8
-    GREEN = (0, 255, 0)
-    WHITE = (255, 255, 255)
 
-    # Initialize the camera feed
-    cap = VideoCaptureAsync(0).start()
-
-    if not cap.isOpened():
-        print("Failed to open camera.")
-        return
-
-    # Get frame dimensions
-    ret, frame = cap.read()
-    if not ret:
-        print("Failed to read frame.")
-        return
-    frame_height, frame_width = frame.shape[:2]
-
-    # Zone setup
-    buffer = min(240, frame_width // 2, frame_height // 2)
-    ZONE_POLY = np.array([[buffer, 0], [frame_width - buffer, 0], [frame_width - buffer, frame_height], [buffer, frame_height]])
-
-    # Load YOLO model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = YOLO("yolov8n.pt").to(device)
-
-    # Initialize DeepSORT tracker
-    tracker = DeepSort(max_age=50, nn_budget=100, embedder="mobilenet", embedder_gpu=True)
-
-    # Dictionary to store consistent IDs
-    track_history = {}
-
-    # Local cache for database operations
-    db_cache = {}
-    frame_count = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_count += 1
-        if frame_count % 3 != 0:  # Process every 3rd frame
-            continue
-
-        # Run YOLO detection
-        detections = model(frame, size=320)[0]  # Reduce input size for YOLO
-
-        # Process detections
-        results = []
-        for data in detections.boxes.data.tolist():
-            confidence = data[4]
-            if float(confidence) < CONFIDENCE_THRESHOLD:
-                continue
-            xmin, ymin, xmax, ymax = int(data[0]), int(data[1]), int(data[2]), int(data[3])
-            class_id = int(data[5])
-            results.append([[xmin, ymin, xmax - xmin, ymax - ymin], confidence, class_id])
-
-        # Update tracks
-        tracks = tracker.update_tracks(results, frame=frame)
-
-        current_frame_items = set()
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-
-            track_id = track.track_id
-            ltrb = track.to_ltrb()
-            xmin, ymin, xmax, ymax = int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])
-            
-            box_center = ((xmin + xmax) / 2, (ymin + ymax) / 2)
-            inside_zone = cv2.pointPolygonTest(ZONE_POLY, box_center, False) >= 0
-            
-            # Get class name for the track
-            if hasattr(track, 'det_class'):
-                class_name = model.names[track.det_class]
-            else:
-                class_name = "unknown"
-            
-            # Generate or retrieve consistent ID for the track
-            if track_id not in track_history:
-                track_history[track_id] = f"{class_name}_{len(track_history) + 1}"
-            
-            unique_id = track_history[track_id]
-            current_frame_items.add(unique_id)
-            
-            # Update local cache
-            if unique_id not in db_cache:
-                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
-            elif db_cache[unique_id]["is_inside"] != inside_zone:
-                db_cache[unique_id] = {"is_inside": inside_zone, "last_update": datetime.now()}
-
-            color = GREEN if inside_zone else (0, 0, 255)
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-            cv2.rectangle(frame, (xmin, ymin - 20), (xmax, ymin), color, -1)
-            cv2.putText(frame, unique_id, (xmin + 5, ymin - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 2)
-
-        # Draw zone
-        cv2.polylines(frame, [ZONE_POLY], isClosed=True, color=(255, 255, 0), thickness=2)
-
-        # Display frame
-        cv2.imshow('Object Tracking', frame)
-
-        # Batch update database every 30 frames
-        if frame_count % 30 == 0:
-            update_database(db_cache)
-            db_cache.clear()
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.stop()
-    cv2.destroyAllWindows()
 
 def update_database(db_cache):
     for item_id, data in db_cache.items():
