@@ -106,7 +106,7 @@ export default function DashboardDefault() {
     };
 
     pollAPI();
-    const intervalId = setInterval(pollAPI, 2000);
+    const intervalId = setInterval(pollAPI, 1000);
     return () => clearInterval(intervalId);
   }, []);
 
